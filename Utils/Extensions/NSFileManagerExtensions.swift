@@ -55,10 +55,7 @@ public extension NSFileManager {
             return 0
         }
 
-        // First try to get the total allocated size and in failing that, get the file allocated size
-        return itemURL.getResourceLongLongForKey(NSURLTotalFileAllocatedSizeKey)
-            ?? itemURL.getResourceLongLongForKey(NSURLFileAllocatedSizeKey)
-            ?? 0
+        return (url as? NSURL)?.allocatedFileSize() ?? 0
     }
 
     func allocatedSizeOfDirectoryAtURL(url: NSURL, forFilesPrefixedWith prefix: String, isLargerThanBytes threshold: Int64) throws -> Bool {
@@ -87,6 +84,12 @@ public extension NSFileManager {
             let size = try sizeForItemURL($1, withPrefix: prefix)
             return $0 + size
         }
+    }
+
+    func contentsOfDirectoryAtPath(path: String, withFilenamePrefix prefix: String) throws -> [String] {
+        return try NSFileManager.defaultManager().contentsOfDirectoryAtPath(path)
+            .filter { $0.hasPrefix("\(prefix).") }
+            .sort { $0 < $1 }
     }
 
     private func errorWithCode(code: NSFileManagerExtensionsErrorCodes, underlyingError error: NSError? = nil) -> NSError {

@@ -12,8 +12,8 @@ import XCGLogger
 
 private let log = Logger.syncLogger
 
-public let ProfileDidStartSyncingNotification = "ProfileDidStartSyncingNotification"
-public let ProfileDidFinishSyncingNotification = "ProfileDidFinishSyncingNotification"
+public let NotificationProfileDidStartSyncing = "NotificationProfileDidStartSyncing"
+public let NotificationProfileDidFinishSyncing = "NotificationProfileDidFinishSyncing"
 public let ProfileRemoteTabsSyncDelay: NSTimeInterval = 0.1
 
 public protocol SyncManager {
@@ -183,13 +183,14 @@ public class BrowserProfile: Profile {
      * see Bug 1218833. Be sure to only perform synchronous actions here.
      */
     init(localName: String, app: UIApplication?) {
+        log.debug("Initing profile \(localName) on thread \(NSThread.currentThread()).")
         self.name = localName
         self.files = ProfileFileAccessor(localName: localName)
         self.app = app
 
         let notificationCenter = NSNotificationCenter.defaultCenter()
         notificationCenter.addObserver(self, selector: Selector("onLocationChange:"), name: NotificationOnLocationChange, object: nil)
-        notificationCenter.addObserver(self, selector: Selector("onProfileDidFinishSyncing:"), name: ProfileDidFinishSyncingNotification, object: nil)
+        notificationCenter.addObserver(self, selector: Selector("onProfileDidFinishSyncing:"), name: NotificationProfileDidFinishSyncing, object: nil)
         notificationCenter.addObserver(self, selector: Selector("onPrivateDataClearedHistory:"), name: NotificationPrivateDataClearedHistory, object: nil)
 
 
@@ -219,12 +220,14 @@ public class BrowserProfile: Profile {
     }
 
     func shutdown() {
+        log.debug("Shutting down profile.")
+
         if self.dbCreated {
-            db.close()
+            db.forceClose()
         }
 
         if self.loginsDBCreated {
-            loginsDB.close()
+            loginsDB.forceClose()
         }
     }
 
@@ -261,9 +264,10 @@ public class BrowserProfile: Profile {
     }
 
     deinit {
+        log.debug("Deiniting profile \(self.localName).")
         self.syncManager.endTimedSyncs()
         NSNotificationCenter.defaultCenter().removeObserver(self, name: NotificationOnLocationChange, object: nil)
-        NSNotificationCenter.defaultCenter().removeObserver(self, name: ProfileDidFinishSyncingNotification, object: nil)
+        NSNotificationCenter.defaultCenter().removeObserver(self, name: NotificationProfileDidFinishSyncing, object: nil)
         NSNotificationCenter.defaultCenter().removeObserver(self, name: NotificationPrivateDataClearedHistory, object: nil)
     }
 
@@ -382,17 +386,28 @@ public class BrowserProfile: Profile {
         return SQLiteLogins(db: self.loginsDB)
     }()
 
-    private lazy var loginsKey: String? = {
+    // This is currently only used within the dispatch_once block in loginsDB, so we don't
+    // have to worry about races giving us two keys. But if this were ever to be used
+    // elsewhere, it'd be unsafe, so we wrap this in a dispatch_once, too.
+    private var loginsKey: String? {
         let key = "sqlcipher.key.logins.db"
-        if KeychainWrapper.hasValueForKey(key) {
-            return KeychainWrapper.stringForKey(key)
+        struct Singleton {
+            static var token: dispatch_once_t = 0
+            static var instance: String!
         }
-
-        let Length: UInt = 256
-        let secret = Bytes.generateRandomBytes(Length).base64EncodedString
-        KeychainWrapper.setString(secret, forKey: key)
-        return secret
-    }()
+        dispatch_once(&Singleton.token) {
+            if KeychainWrapper.hasValueForKey(key) {
+                let value = KeychainWrapper.stringForKey(key)
+                Singleton.instance = value
+            } else {
+                let Length: UInt = 256
+                let secret = Bytes.generateRandomBytes(Length).base64EncodedString
+                KeychainWrapper.setString(secret, forKey: key)
+                Singleton.instance = secret
+            }
+        }
+        return Singleton.instance
+    }
 
     private var loginsDBCreated = false
     private lazy var loginsDB: BrowserDB = {
@@ -526,7 +541,7 @@ public class BrowserProfile: Profile {
          */
         var syncLock = OSSpinLock() {
             didSet {
-                let notification = syncLock == 0 ? ProfileDidFinishSyncingNotification : ProfileDidStartSyncingNotification
+                let notification = syncLock == 0 ? NotificationProfileDidFinishSyncing : NotificationProfileDidStartSyncing
                 NSNotificationCenter.defaultCenter().postNotification(NSNotification(name: notification, object: nil))
             }
         }
@@ -552,15 +567,55 @@ public class BrowserProfile: Profile {
             super.init()
 
             let center = NSNotificationCenter.defaultCenter()
+            center.addObserver(self, selector: "onDatabaseWasRecreated:", name: NotificationDatabaseWasRecreated, object: nil)
             center.addObserver(self, selector: "onLoginDidChange:", name: NotificationDataLoginDidChange, object: nil)
-            center.addObserver(self, selector: "onFinishSyncing:", name: ProfileDidFinishSyncingNotification, object: nil)
+            center.addObserver(self, selector: "onFinishSyncing:", name: NotificationProfileDidFinishSyncing, object: nil)
         }
 
         deinit {
             // Remove 'em all.
             let center = NSNotificationCenter.defaultCenter()
+            center.removeObserver(self, name: NotificationDatabaseWasRecreated, object: nil)
             center.removeObserver(self, name: NotificationDataLoginDidChange, object: nil)
-            center.removeObserver(self, name: ProfileDidFinishSyncingNotification, object: nil)
+            center.removeObserver(self, name: NotificationProfileDidFinishSyncing, object: nil)
+        }
+
+        private func handleRecreationOfDatabaseNamed(name: String?) -> Success {
+            let loginsCollections = ["passwords"]
+            let browserCollections = ["bookmarks", "history", "tabs"]
+
+            switch name ?? "<all>" {
+            case "<all>":
+                return self.locallyResetCollections(loginsCollections + browserCollections)
+            case "logins.db":
+                return self.locallyResetCollections(loginsCollections)
+            case "browser.db":
+                return self.locallyResetCollections(browserCollections)
+            default:
+                log.debug("Unknown database \(name).")
+                return succeed()
+            }
+        }
+
+        @objc
+        func onDatabaseWasRecreated(notification: NSNotification) {
+            log.debug("Database was recreated.")
+            let name = notification.object as? String
+            log.debug("Database was \(name).")
+
+            // We run this in the background after a few hundred milliseconds;
+            // it doesn't really matter when it runs, so long as it doesn't
+            // happen in the middle of a sync. We take the lock to prevent that.
+            let delay = 300 * Int64(NSEC_PER_MSEC)     // 300msec.
+            let when = dispatch_time(DISPATCH_TIME_NOW, delay)
+            let queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0)
+            dispatch_after(when, queue) {
+                OSSpinLockLock(&self.syncLock)
+                self.handleRecreationOfDatabaseNamed(name).upon { res in
+                    log.debug("Reset of \(name) done: \(res.isSuccess)")
+                    OSSpinLockUnlock(&self.syncLock)
+                }
+            }
         }
 
         // Simple in-memory rate limiting.
@@ -574,8 +629,11 @@ public class BrowserProfile: Profile {
                 let when: dispatch_time_t = dispatch_time(DISPATCH_TIME_NOW, SyncConstants.SyncDelayTriggered)
 
                 // Trigger on the main queue. The bulk of the sync work runs in the background.
+                let greenLight = self.greenLight()
                 dispatch_after(when, dispatch_get_main_queue()) {
-                    self.syncLogins()
+                    if greenLight() {
+                        self.syncLogins()
+                    }
                 }
             }
         }
@@ -590,6 +648,10 @@ public class BrowserProfile: Profile {
 
         func onAddedAccount() -> Success {
             return self.syncEverything()
+        }
+
+        func locallyResetCollections(collections: [String]) -> Success {
+            return walk(collections, f: self.locallyResetCollection)
         }
 
         func locallyResetCollection(collection: String) -> Success {

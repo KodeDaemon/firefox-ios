@@ -467,8 +467,14 @@ private class DeleteExportedDataSetting: HiddenSetting {
 
     override func onClick(navigationController: UINavigationController?) {
         let documentsPath = NSSearchPathForDirectoriesInDomains(.DocumentDirectory, .UserDomainMask, true)[0]
+        let fileManager = NSFileManager.defaultManager()
         do {
-            try NSFileManager.defaultManager().removeItemInDirectory(documentsPath, named: "browser.db")
+            let files = try fileManager.contentsOfDirectoryAtPath(documentsPath)
+            for file in files {
+                if file.startsWith("browser.") || file.startsWith("logins.") {
+                    try fileManager.removeItemInDirectory(documentsPath, named: file)
+                }
+            }
         } catch {
             print("Couldn't delete exported data: \(error).")
         }
@@ -483,12 +489,14 @@ private class ExportBrowserDataSetting: HiddenSetting {
 
     override func onClick(navigationController: UINavigationController?) {
         let documentsPath = NSSearchPathForDirectoriesInDomains(.DocumentDirectory, .UserDomainMask, true)[0]
-        if let browserDB = NSURL.fileURLWithPath(documentsPath).URLByAppendingPathComponent("browser.db").path {
-            do {
-                try self.settings.profile.files.copy("browser.db", toAbsolutePath: browserDB)
-            } catch {
-                print("Couldn't export browser data: \(error).")
+        do {
+            let log = Logger.syncLogger
+            try self.settings.profile.files.copyMatching(fromRelativeDirectory: "", toAbsoluteDirectory: documentsPath) { file in
+                log.debug("Matcher: \(file)")
+                return file.startsWith("browser.") || file.startsWith("logins.")
             }
+        } catch {
+            print("Couldn't export browser data: \(error).")
         }
     }
 }
@@ -629,6 +637,24 @@ private class SearchSetting: Setting {
     }
 }
 
+private class LoginsSetting: Setting {
+    let profile: Profile
+    var tabManager: TabManager!
+
+    override var accessoryType: UITableViewCellAccessoryType { return .DisclosureIndicator }
+
+    init(settings: SettingsTableViewController) {
+        self.profile = settings.profile
+        self.tabManager = settings.tabManager
+
+        let loginsTitle = NSLocalizedString("Logins", comment: "Label used as an item in Settings. When touched, the user will be navigated to the Logins/Password manager.")
+        super.init(title: NSAttributedString(string: loginsTitle, attributes: [NSForegroundColorAttributeName: UIConstants.TableViewRowTextColor]))
+    }
+
+    override func onClick(navigationController: UINavigationController?) {
+    }
+}
+
 private class ClearPrivateDataSetting: Setting {
     let profile: Profile
     var tabManager: TabManager!
@@ -720,7 +746,7 @@ class SettingsTableViewController: UITableViewController {
             SettingSection(title: NSAttributedString(string: NSLocalizedString("General", comment: "General settings section title")), children: generalSettings)
         ]
 
-        var privacySettings: [Setting] = [ClearPrivateDataSetting(settings: self)]
+        var privacySettings: [Setting] = [LoginsSetting(settings: self), ClearPrivateDataSetting(settings: self)]
 
         if #available(iOS 9, *) {
             privacySettings += [
@@ -763,7 +789,7 @@ class SettingsTableViewController: UITableViewController {
             style: UIBarButtonItemStyle.Done,
             target: navigationController, action: "SELdone")
         tableView.registerClass(SettingsTableViewCell.self, forCellReuseIdentifier: Identifier)
-        tableView.registerClass(SettingsTableSectionHeaderView.self, forHeaderFooterViewReuseIdentifier: SectionHeaderIdentifier)
+        tableView.registerClass(SettingsTableSectionHeaderFooterView.self, forHeaderFooterViewReuseIdentifier: SectionHeaderIdentifier)
         tableView.tableFooterView = SettingsTableFooterView(frame: CGRect(x: 0, y: 0, width: view.frame.width, height: 128))
 
         tableView.separatorColor = UIConstants.TableViewSeparatorColor
@@ -772,8 +798,8 @@ class SettingsTableViewController: UITableViewController {
 
     override func viewWillAppear(animated: Bool) {
         super.viewWillAppear(animated)
-        NSNotificationCenter.defaultCenter().addObserver(self, selector: "SELsyncDidChangeState", name: ProfileDidStartSyncingNotification, object: nil)
-        NSNotificationCenter.defaultCenter().addObserver(self, selector: "SELsyncDidChangeState", name: ProfileDidFinishSyncingNotification, object: nil)
+        NSNotificationCenter.defaultCenter().addObserver(self, selector: "SELsyncDidChangeState", name: NotificationProfileDidStartSyncing, object: nil)
+        NSNotificationCenter.defaultCenter().addObserver(self, selector: "SELsyncDidChangeState", name: NotificationProfileDidFinishSyncing, object: nil)
     }
 
     override func viewDidAppear(animated: Bool) {
@@ -783,8 +809,8 @@ class SettingsTableViewController: UITableViewController {
 
     override func viewDidDisappear(animated: Bool) {
         super.viewDidDisappear(animated)
-        NSNotificationCenter.defaultCenter().removeObserver(self, name: ProfileDidStartSyncingNotification, object: nil)
-        NSNotificationCenter.defaultCenter().removeObserver(self, name: ProfileDidFinishSyncingNotification, object: nil)
+        NSNotificationCenter.defaultCenter().removeObserver(self, name: NotificationProfileDidStartSyncing, object: nil)
+        NSNotificationCenter.defaultCenter().removeObserver(self, name: NotificationProfileDidFinishSyncing, object: nil)
     }
 
     @objc private func SELsyncDidChangeState() {
@@ -834,7 +860,7 @@ class SettingsTableViewController: UITableViewController {
     }
 
     override func tableView(tableView: UITableView, viewForHeaderInSection section: Int) -> UIView? {
-        let headerView = tableView.dequeueReusableHeaderFooterViewWithIdentifier(SectionHeaderIdentifier) as! SettingsTableSectionHeaderView
+        let headerView = tableView.dequeueReusableHeaderFooterViewWithIdentifier(SectionHeaderIdentifier) as! SettingsTableSectionHeaderFooterView
         let sectionSetting = settings[section]
         if let sectionTitle = sectionSetting.title?.string {
             headerView.titleLabel.text = sectionTitle
@@ -877,7 +903,7 @@ class SettingsTableViewController: UITableViewController {
         }
 
         if #available(iOS 9, *) {
-            if indexPath.section == 2 && indexPath.row == 1 {
+            if indexPath.section == 2 && indexPath.row == 2 {
                 return 64
             }
         }
@@ -917,7 +943,7 @@ class SettingsTableFooterView: UIView {
     }
 }
 
-class SettingsTableSectionHeaderView: UITableViewHeaderFooterView {
+class SettingsTableSectionHeaderFooterView: UITableViewHeaderFooterView {
     var showTopBorder: Bool = true {
         didSet {
             topBorder.hidden = !showTopBorder
@@ -960,6 +986,12 @@ class SettingsTableSectionHeaderView: UITableViewHeaderFooterView {
         clipsToBounds = true
         layer.addSublayer(topBorder)
         layer.addSublayer(bottomBorder)
+    }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        showTopBorder = true
+        showBottomBorder = true
     }
 
     required init?(coder aDecoder: NSCoder) {

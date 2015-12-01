@@ -8,9 +8,11 @@ import Shared
 private let SectionToggles = 0
 private let SectionButton = 1
 private let NumberOfSections = 2
-private let SectionHeaderIdentifier = "SectionHeaderIdentifier"
-private let HeaderHeight: CGFloat = 44
+private let SectionHeaderFooterIdentifier = "SectionHeaderFooterIdentifier"
+private let HeaderFooterHeight: CGFloat = 44
 private let TogglesPrefKey = "clearprivatedata.toggles"
+
+private let log = Logger.browserLogger
 
 class ClearPrivateDataTableViewController: UITableViewController {
     private var clearButton: UITableViewCell?
@@ -18,13 +20,14 @@ class ClearPrivateDataTableViewController: UITableViewController {
     var profile: Profile!
     var tabManager: TabManager!
 
-    private lazy var clearables: [Clearable] = {
+    private typealias DefaultCheckedState = Bool
+
+    private lazy var clearables: [(clearable: Clearable, checked: DefaultCheckedState)] = {
         return [
-            HistoryClearable(profile: self.profile),
-            CacheClearable(tabManager: self.tabManager),
-            CookiesClearable(tabManager: self.tabManager),
-            SiteDataClearable(tabManager: self.tabManager),
-            PasswordsClearable(profile: self.profile),
+            (HistoryClearable(profile: self.profile), true),
+            (CacheClearable(tabManager: self.tabManager), true),
+            (CookiesClearable(tabManager: self.tabManager), true),
+            (SiteDataClearable(tabManager: self.tabManager), true),
         ]
     }()
 
@@ -33,7 +36,7 @@ class ClearPrivateDataTableViewController: UITableViewController {
             return savedToggles
         }
 
-        return [Bool](count: self.clearables.count, repeatedValue: true)
+        return self.clearables.map { $0.checked }
     }()
 
     private var clearButtonEnabled = true {
@@ -47,19 +50,20 @@ class ClearPrivateDataTableViewController: UITableViewController {
 
         title = NSLocalizedString("Clear Private Data", tableName: "ClearPrivateData", comment: "Navigation title in settings.")
 
-        tableView.registerClass(SettingsTableSectionHeaderView.self, forHeaderFooterViewReuseIdentifier: SectionHeaderIdentifier)
+        tableView.registerClass(SettingsTableSectionHeaderFooterView.self, forHeaderFooterViewReuseIdentifier: SectionHeaderFooterIdentifier)
 
         tableView.separatorColor = UIConstants.TableViewSeparatorColor
         tableView.backgroundColor = UIConstants.TableViewHeaderBackgroundColor
-
-        tableView.tableFooterView = UIView()
+        let footer = SettingsTableSectionHeaderFooterView(frame: CGRect(x: 0, y: 0, width: tableView.bounds.width, height: HeaderFooterHeight))
+        footer.showBottomBorder = false
+        tableView.tableFooterView = footer
     }
 
     override func tableView(tableView: UITableView, cellForRowAtIndexPath indexPath: NSIndexPath) -> UITableViewCell {
         let cell = UITableViewCell(style: UITableViewCellStyle.Default, reuseIdentifier: nil)
 
         if indexPath.section == SectionToggles {
-            cell.textLabel?.text = clearables[indexPath.item].label
+            cell.textLabel?.text = clearables[indexPath.item].clearable.label
             let control = UISwitch()
             control.onTintColor = UIConstants.ControlTintColor
             control.addTarget(self, action: "switchValueChanged:", forControlEvents: UIControlEvents.ValueChanged)
@@ -75,9 +79,6 @@ class ClearPrivateDataTableViewController: UITableViewController {
             cell.accessibilityTraits = UIAccessibilityTraitButton
             clearButton = cell
         }
-
-        // Make the separator line fill the entire table width.
-        cell.separatorInset = UIEdgeInsetsZero
 
         return cell
     }
@@ -105,10 +106,16 @@ class ClearPrivateDataTableViewController: UITableViewController {
     override func tableView(tableView: UITableView, didSelectRowAtIndexPath indexPath: NSIndexPath) {
         guard indexPath.section == SectionButton else { return }
 
+        let toggles = self.toggles
         clearables
             .enumerate()
-            .filter { (i, _) in toggles[i] }
-            .map { (_, clearable) in clearable.clear() }
+            .flatMap { (i, pair) in
+                guard toggles[i] else {
+                    return nil
+                }
+                log.debug("Clearing \(pair.clearable).")
+                return pair.clearable.clear()
+            }
             .allSucceed()
             .upon { result in
                 assert(result.isSuccess, "Private data cleared successfully")
@@ -124,11 +131,11 @@ class ClearPrivateDataTableViewController: UITableViewController {
     }
 
     override func tableView(tableView: UITableView, viewForHeaderInSection section: Int) -> UIView? {
-        return tableView.dequeueReusableHeaderFooterViewWithIdentifier(SectionHeaderIdentifier) as! SettingsTableSectionHeaderView
+        return tableView.dequeueReusableHeaderFooterViewWithIdentifier(SectionHeaderFooterIdentifier) as! SettingsTableSectionHeaderFooterView
     }
 
     override func tableView(tableView: UITableView, heightForHeaderInSection section: Int) -> CGFloat {
-        return HeaderHeight
+        return HeaderFooterHeight
     }
 
     @objc func switchValueChanged(toggle: UISwitch) {
